@@ -1,0 +1,19 @@
+[project]
+name = "mojo-babel"
+version = "0.1.0"
+description = "Babel-compatible locale formatting with Mojo batch kernels"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Lee Penkman", email = "leepenkman@gmail.com" }]
+dependencies = ["babel>=2.14", "numpy>=1.26"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = { "" = "python" }
+
+[tool.setuptools.packages.find]
+where = ["python"]
