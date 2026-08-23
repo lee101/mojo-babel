@@ -78,37 +78,41 @@ print(format_date_batch(days, locale="en_US"))
 
 ## Benchmarks
 
-Measured by `pixi run bench` on this machine on 2026-07-30: Intel Xeon E5-2697
+Measured by `pixi run bench` on this machine on 2026-08-23: Intel Xeon E5-2697
 v4 at 2.30 GHz, x86-64, 72 logical CPUs. Each row formats 50,000 values; the
 best of three runs is reported. The reference is the installed Babel 2.18.0
 through its public scalar API.
 
 | case | mojo-babel | Babel | speedup |
 | --- | ---: | ---: | ---: |
-| decimal, 50k, en_US | 174.3 ms | 1031.6 ms | 5.92x |
-| decimal, 50k, hi_IN | 323.6 ms | 1001.2 ms | 3.09x |
-| currency, 50k, fr_FR | 241.2 ms | 2359.5 ms | 9.78x |
-| percent, 50k, de_DE | 376.7 ms | 850.9 ms | 2.26x |
-| date, 50k datetime64, en_US | 38.7 ms | 867.6 ms | 22.40x |
-| date, 50k datetime64, ja_JP | 48.7 ms | 863.7 ms | 17.75x |
-| datetime, 50k, de_DE | 188.9 ms | 1019.9 ms | 5.40x |
+| decimal, 50k, en_US | 154.3 ms | 919.9 ms | 5.96x |
+| decimal, 50k, hi_IN | 155.6 ms | 980.2 ms | 6.30x |
+| currency, 50k, fr_FR | 165.1 ms | 2197.1 ms | 13.30x |
+| percent, 50k, de_DE | 76.7 ms | 830.5 ms | 10.83x |
+| date, 50k datetime64, en_US | 33.0 ms | 511.6 ms | 15.52x |
+| date, 50k datetime64, ja_JP | 45.6 ms | 563.7 ms | 12.37x |
+| datetime, 50k, de_DE | 169.4 ms | 972.5 ms | 5.74x |
 
 Run `pixi run bench` on the target machine instead of treating these results as
 portable; locale mix, string lengths, and CPU frequency all matter.
 
 There is no GPU path. These kernels perform irregular integer division,
-variable-length digit emission, and short UTF-8 writes; the benchmark covers
-only the CPU implementation.
+variable-length digit emission, and short UTF-8 writes with less than two
+arithmetic operations per byte moved. CPU profiling also shows that the native
+row renderer is too short to amortize thread-launch overhead, so it remains
+serial; the benchmark covers only the CPU implementation.
 
 ## How it works
 
 Python resolves a Babel `Locale`, compiles its number or date pattern once, and
-allocates contiguous NumPy buffers. Decimal rounding stays in Python so results
-retain Babel's `Decimal(str(value))` and half-even semantics. Quantized signed
-64-bit magnitudes then cross the C ABI as integer addresses. Mojo uses SIMD to
-split full vector-width blocks into integer and fractional parts, handles the
-remainder with a scalar tail, and inserts locale-specific UTF-8 separators and
-digits into exact-sized caller-owned byte rows.
+allocates contiguous NumPy buffers. Decimal inputs and ambiguous float rounding
+lanes use Babel's `Decimal(str(value))` and half-even semantics. Large percent
+batches prepare safe float lanes with vectorized NumPy operations, falling back
+to `Decimal` for values within four ULPs of a half-even boundary. Quantized
+signed 64-bit magnitudes then cross the C ABI as integer addresses. Mojo uses
+SIMD to split full vector-width blocks into integer and fractional parts,
+handles the remainder with a scalar tail, and inserts locale-specific UTF-8
+separators and digits into exact-sized caller-owned byte rows.
 
 Date patterns are compiled into a compact three-integer instruction stream.
 Localized names and literals are packed into UTF-8 byte tables with 64-bit

@@ -150,6 +150,18 @@ def test_percent_batch_parity():
     assert numbers.format_percent_batch(VALUES, locale="ru_RU") == expected
 
 
+def test_percent_vector_preparation_half_even_and_tail():
+    values = [float(index) / 200 for index in range(-517, 520)]
+    expected = [reference.format_percent(value, locale="de_DE") for value in values]
+    assert numbers.format_percent_batch(values, locale="de_DE") == expected
+
+
+@pytest.mark.parametrize("size", [255, 256])
+def test_percent_vector_preparation_threshold(size):
+    values = [12.345] * size
+    assert numbers.format_percent_batch(values, locale="en_US") == ["1,234%"] * size
+
+
 def test_invalid_numbering_system_matches_exception():
     with pytest.raises(reference.UnsupportedNumberingSystemError):
         numbers.format_decimal(1, locale="en_US", numbering_system="nope")

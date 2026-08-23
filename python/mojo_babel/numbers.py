@@ -18,6 +18,7 @@ LC_MONETARY = _babel.LC_MONETARY
 UnknownCurrencyFormatError = _babel.UnknownCurrencyFormatError
 UnsupportedNumberingSystemError = _babel.UnsupportedNumberingSystemError
 _INT64_MAX = np.iinfo(np.int64).max
+_VECTOR_PREP_THRESHOLD = 256
 
 
 def _locale(value, category: str) -> Locale:
@@ -96,6 +97,35 @@ def _decimal_value(number) -> decimal.Decimal:
     return decimal.Decimal(str(number))
 
 
+def _prepare_scaled_floats(
+    raw: list,
+    pattern_scale: int,
+    max_frac: int,
+    quantum: decimal.Decimal,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    if len(raw) < _VECTOR_PREP_THRESHOLD or not all(
+        type(value) is float for value in raw
+    ):
+        return None
+    values = np.asarray(raw, dtype=np.float64)
+    magnitudes = np.abs(values)
+    factor = float(10 ** (pattern_scale + max_frac))
+    products = magnitudes * factor
+    if not np.all(np.isfinite(products)) or np.any(products >= float(1 << 63)):
+        return None
+
+    nearest = np.rint(products)
+    distance_to_half = np.abs(np.abs(products - nearest) - 0.5)
+    ambiguous = distance_to_half <= 4 * np.spacing(products)
+    scaled = np.empty(len(raw), dtype=np.int64)
+    safe = ~ambiguous
+    scaled[safe] = nearest[safe].astype(np.int64)
+    for index in np.flatnonzero(ambiguous):
+        value = abs(decimal.Decimal(str(raw[index])).scaleb(pattern_scale))
+        scaled[index] = int(value.quantize(quantum).scaleb(max_frac))
+    return scaled, np.signbit(values)
+
+
 def _replace_affixes(
     text: str,
     currency: str | None,
@@ -153,40 +183,50 @@ def _render_many(
     else:
         fraction = pattern.frac_prec
 
-    prepared: list[tuple[decimal.Decimal, int]] = []
-    scaled_values = np.empty(len(raw), dtype=np.int64)
+    prepared: list[decimal.Decimal] = []
+    negative_flags: list[int] | np.ndarray = []
     fallback = False
     base_max_frac = fraction[1]
     base_quantum = _babel.get_decimal_quantum(base_max_frac)
-    for index, number in enumerate(raw):
-        value = _decimal_value(number)
-        if pattern.scale:
-            value = value.scaleb(pattern.scale)
-        if not value.is_finite():
-            fallback = True
-            break
-        negative = int(value.is_signed())
-        value = abs(value)
-        if not decimal_quantization or dynamic_currency_name:
-            value = value.normalize()
-        value_max_frac = base_max_frac
-        if not decimal_quantization:
-            value_max_frac = max(value_max_frac, _babel.get_decimal_precision(value))
-        if value_max_frac > 18:
-            fallback = True
-            break
-        quantum = (
-            base_quantum
-            if value_max_frac == base_max_frac
-            else _babel.get_decimal_quantum(value_max_frac)
+    fast_prepared = None
+    if decimal_quantization and not dynamic_currency_name and pattern.scale:
+        fast_prepared = _prepare_scaled_floats(
+            raw, pattern.scale, base_max_frac, base_quantum
         )
-        rounded = value.quantize(quantum)
-        scaled = int(rounded.scaleb(value_max_frac))
-        if scaled > _INT64_MAX:
-            fallback = True
-            break
-        prepared.append((value, negative))
-        scaled_values[index] = scaled
+    if fast_prepared is not None:
+        scaled_values, negative_flags = fast_prepared
+    else:
+        scaled_values = np.empty(len(raw), dtype=np.int64)
+        for index, number in enumerate(raw):
+            value = _decimal_value(number)
+            if pattern.scale:
+                value = value.scaleb(pattern.scale)
+            if not value.is_finite():
+                fallback = True
+                break
+            negative = int(value.is_signed())
+            value = abs(value)
+            if not decimal_quantization or dynamic_currency_name:
+                value = value.normalize()
+            value_max_frac = base_max_frac
+            if not decimal_quantization:
+                value_max_frac = max(value_max_frac, _babel.get_decimal_precision(value))
+            if value_max_frac > 18:
+                fallback = True
+                break
+            quantum = (
+                base_quantum
+                if value_max_frac == base_max_frac
+                else _babel.get_decimal_quantum(value_max_frac)
+            )
+            rounded = value.quantize(quantum)
+            scaled = int(rounded.scaleb(value_max_frac))
+            if scaled > _INT64_MAX:
+                fallback = True
+                break
+            prepared.append(value)
+            negative_flags.append(negative)
+            scaled_values[index] = scaled
 
     if fallback:
         return [
@@ -206,11 +246,11 @@ def _render_many(
     if not decimal_quantization and prepared:
         max_frac = max(
             max_frac,
-            max(_babel.get_decimal_precision(value) for value, _ in prepared),
+            max(_babel.get_decimal_precision(value) for value in prepared),
         )
         quantum = _babel.get_decimal_quantum(max_frac)
         rescales: list[int] = []
-        for index, (value, _) in enumerate(prepared):
+        for value in prepared:
             scaled = int(value.quantize(quantum).scaleb(max_frac))
             if scaled > _INT64_MAX:
                 return [
@@ -252,10 +292,11 @@ def _render_many(
             for affix in pattern.suffix
         )
     rendered = []
-    for (value, negative), core in zip(prepared, cores):
+    for index, core in enumerate(cores):
+        negative = int(negative_flags[index])
         text = prefixes[negative] + core + suffixes[negative]
         if dynamic_currency_name:
-            text = _replace_affixes(text, currency, value, locale)
+            text = _replace_affixes(text, currency, prepared[index], locale)
         rendered.append(text)
     return rendered
 
