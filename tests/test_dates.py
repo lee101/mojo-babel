@@ -128,9 +128,10 @@ def test_numpy_datetime_temporary_is_retained_and_input_is_unchanged():
 
 
 def test_native_entry_points_reject_null_buffers():
-    assert dates.lib().mb_decompose_days(0, 1, 0) == -2
+    # the trailing argument is the row-loop worker count (0 = serial)
+    assert dates.lib().mb_decompose_days(0, 1, 0, 0) == -2
     assert dates.lib().mb_format_dates(
-        0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 256, 0
+        0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 256, 0, 0
     ) == -2
 
 

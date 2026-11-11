@@ -17,9 +17,9 @@ LIB_PATH = os.environ.get(
 I = ctypes.c_int64
 
 _SIGNATURES = {
-    "mb_format_scaled": ([I] * 15, I),
-    "mb_format_dates": ([I] * 13, I),
-    "mb_decompose_days": ([I, I, I], I),
+    "mb_format_scaled": ([I] * 16, I),
+    "mb_format_dates": ([I] * 14, I),
+    "mb_decompose_days": ([I] * 4, I),
 }
 
 
@@ -68,3 +68,19 @@ def addr(array: np.ndarray) -> int:
 
 def bytes_array(value: str) -> np.ndarray:
     return np.frombuffer(value.encode("utf-8"), dtype=np.uint8)
+
+
+# Row-loop processor count handed to the kernels. 0 keeps them serial; the
+# kernels clamp anything above their own cap. Overridable for A/B measurement
+# and for the serial-vs-parallel parity test.
+DEFAULT_WORKERS = 4
+
+
+def workers() -> int:
+    value = os.environ.get("MOJO_BABEL_WORKERS")
+    if value is not None:
+        try:
+            return max(0, int(value))
+        except ValueError:
+            pass
+    return DEFAULT_WORKERS

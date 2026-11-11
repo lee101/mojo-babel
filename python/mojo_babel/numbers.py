@@ -11,7 +11,7 @@ from babel import numbers as _babel
 from babel.core import Locale
 from babel.numbers import NumberPattern
 
-from ._lib import addr, bytes_array, lib
+from ._lib import addr, bytes_array, lib, workers
 
 LC_NUMERIC = _babel.LC_NUMERIC
 LC_MONETARY = _babel.LC_MONETARY
@@ -80,6 +80,7 @@ def _core(
         addr(output),
         stride,
         addr(lengths),
+        workers(),
     )
     if status == -1:
         raise OverflowError("formatted number exceeds the Mojo output stride")

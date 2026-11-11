@@ -11,7 +11,7 @@ import numpy as np
 from babel import dates as _babel
 from babel.core import Locale
 
-from ._lib import addr, lib
+from ._lib import addr, lib, workers
 
 LC_TIME = _babel.LC_TIME
 
@@ -185,6 +185,7 @@ def _render(fields: np.ndarray, pattern: str, locale: Locale) -> list[str]:
         addr(output),
         stride,
         addr(lengths),
+        workers(),
     )
     if status == -1:
         raise OverflowError("formatted date exceeds the Mojo output stride")
@@ -303,7 +304,7 @@ def format_date_batch(
             raise ValueError("NaT cannot be formatted")
         days = np.ascontiguousarray(flat, dtype=np.int64)
         fields = np.empty((len(days), 8), dtype=np.int64)
-        status = lib().mb_decompose_days(addr(days), len(days), addr(fields))
+        status = lib().mb_decompose_days(addr(days), len(days), addr(fields), workers())
         if status:
             raise ValueError("invalid buffer passed to Mojo date decomposition")
     else:

@@ -1,9 +1,37 @@
 """Number and date rendering kernels exposed through a single C ABI unit."""
 
 from std.sys.info import simd_width_of
+from max.algorithm import parallelize
 
 comptime IPtr = UnsafePointer[Int64, AnyOrigin[mut=True]]
 comptime BPtr = UnsafePointer[UInt8, AnyOrigin[mut=True]]
+
+# Parallel row rendering. Each exported kernel takes a worker count as its last
+# ABI argument: 0 forces the serial loop, n>0 asks for n workers. The count is
+# clamped to MAX_WORKERS and ignored below that kernel's measured crossover
+# (PARALLEL_MIN_ROWS_*, see README "Parallel phase"), so small batches never pay
+# thread launch.
+comptime MAX_WORKERS = 4
+
+# Parallel crossover, measured with bench/kpar.py (see README "Parallel phase").
+# All three row loops are flat through 57,344 rows on this host, tie at 65,536,
+# and win reliably from 131,072 rows up (1.8-3.1x on 4 workers). One
+# `parallelize` launch costs ~29 us, which is why the small sizes cannot pay.
+# The threshold sits at the first reliably winning size rather than just above
+# the tie, so no caller is handed a path that measured even with serial.
+comptime PARALLEL_MIN_ROWS = 1 << 17
+comptime PARALLEL_MIN_ROWS_SCALED = PARALLEL_MIN_ROWS
+comptime PARALLEL_MIN_ROWS_DATES = PARALLEL_MIN_ROWS
+comptime PARALLEL_MIN_ROWS_DAYS = PARALLEL_MIN_ROWS
+
+
+def worker_count(count: Int, requested: Int, min_rows: Int) -> Int:
+    """0 means serial; otherwise clamp the caller's request to the host rules."""
+    if requested <= 0 or count < min_rows:
+        return 0
+    if requested > MAX_WORKERS:
+        return MAX_WORKERS
+    return requested
 
 
 def copy_bytes(src: BPtr, start: Int, size: Int, dst: BPtr, pos: Int) -> Int:
@@ -137,6 +165,7 @@ def mb_format_scaled(
     dst_addr: Int,
     stride: Int,
     lengths_addr: Int,
+    workers: Int,
 ) abi("C") -> Int:
     if count < 0 or decimals < 0 or decimals > 18 or min_frac < 0 or min_frac > decimals:
         return -2
@@ -180,6 +209,33 @@ def mb_format_scaled(
             lengths[i] = scaled % factor
             i += 1
 
+    var par_workers = worker_count(count, workers, PARALLEL_MIN_ROWS_SCALED)
+    if par_workers > 0:
+        # Nested workers are `{imm}` closures: they cannot mutate a captured
+        # `var`, so the failure flag travels through a pointer cell.
+        var backing = List[Int64](length=1, fill=0)
+        var cell = IPtr(unsafe_from_address=Int(backing.unsafe_ptr()))
+        def work(row: Int) {imm}:
+            if format_scaled_row(
+                row,
+                values,
+                decimals,
+                min_frac,
+                min_int,
+                primary_group,
+                secondary_group,
+                use_group,
+                group,
+                group_len,
+                decimal,
+                decimal_len,
+                dst,
+                stride,
+                lengths,
+            ) != 0:
+                cell[0] = -1
+        parallelize(work, count, par_workers)
+        return Int(cell[0])
     for row in range(count):
         if format_scaled_row(
             row,
@@ -228,6 +284,97 @@ def append_fraction(micros: Int64, width: Int, dst: BPtr, pos: Int, limit: Int) 
     return append_uint(scaled, width, dst, cursor, limit)
 
 
+def format_date_row(
+    row: Int,
+    fields: IPtr,
+    ops: IPtr,
+    op_count: Int,
+    names: BPtr,
+    offsets: IPtr,
+    literals: BPtr,
+    dst: BPtr,
+    stride: Int,
+    lengths: IPtr,
+) -> Int:
+    var base = row * 8
+    var year = fields[base]
+    var month = fields[base + 1]
+    var day = fields[base + 2]
+    var weekday = fields[base + 3]
+    var hour = fields[base + 4]
+    var minute = fields[base + 5]
+    var second = fields[base + 6]
+    var micros = fields[base + 7]
+    if (
+        month < 1
+        or month > 12
+        or day < 1
+        or day > 31
+        or weekday < 0
+        or weekday > 6
+        or hour < 0
+        or hour > 23
+        or minute < 0
+        or minute > 59
+        or second < 0
+        or second > 59
+        or micros < 0
+        or micros > 999999
+    ):
+        return -2
+    var pos = row * stride
+    var limit = pos + stride
+
+    for oi in range(op_count):
+        var op = Int(ops[oi * 3])
+        var width = Int(ops[oi * 3 + 1])
+        var arg = Int(ops[oi * 3 + 2])
+        if op == 0:
+            if pos + width > limit:
+                return -1
+            pos = copy_bytes(literals, arg, width, dst, pos)
+        elif op == 1:
+            var y = year % 100 if width == 2 else year
+            var pad = 2 if width == 2 else width
+            pos = append_uint(y, pad, dst, pos, limit)
+        elif op == 2:
+            pos = append_uint(month, width, dst, pos, limit)
+        elif op == 3:
+            pos = append_name(arg + Int(month) - 1, names, offsets, dst, pos, limit)
+        elif op == 4:
+            pos = append_uint(day, width, dst, pos, limit)
+        elif op == 5:
+            pos = append_name(arg + Int(weekday), names, offsets, dst, pos, limit)
+        elif op == 6:
+            pos = append_uint(hour, width, dst, pos, limit)
+        elif op == 7:
+            var h = hour % 12
+            if h == 0:
+                h = 12
+            pos = append_uint(h, width, dst, pos, limit)
+        elif op == 8:
+            pos = append_uint(hour % 12, width, dst, pos, limit)
+        elif op == 9:
+            var h = hour
+            if h == 0:
+                h = 24
+            pos = append_uint(h, width, dst, pos, limit)
+        elif op == 10:
+            pos = append_uint(minute, width, dst, pos, limit)
+        elif op == 11:
+            pos = append_uint(second, width, dst, pos, limit)
+        elif op == 12:
+            pos = append_fraction(micros, width, dst, pos, limit)
+        elif op == 13:
+            pos = append_name(arg + (1 if hour >= 12 else 0), names, offsets, dst, pos, limit)
+        elif op == 14:
+            pos = append_name(arg + (1 if year >= 0 else 0), names, offsets, dst, pos, limit)
+        if pos < 0:
+            return -1
+    lengths[row] = Int64(pos - row * stride)
+    return 0
+
+
 @export("mb_format_dates")
 def mb_format_dates(
     fields_addr: Int,
@@ -243,6 +390,7 @@ def mb_format_dates(
     dst_addr: Int,
     stride: Int,
     lengths_addr: Int,
+    workers: Int,
 ) abi("C") -> Int:
     if (
         count < 0
@@ -291,83 +439,40 @@ def mb_format_dates(
                 if start < 0 or end < start or end > names_len:
                     return -2
 
+    var par_workers = worker_count(count, workers, PARALLEL_MIN_ROWS_DATES)
+    if par_workers > 0:
+        var backing = List[Int64](length=1, fill=0)
+        var cell = IPtr(unsafe_from_address=Int(backing.unsafe_ptr()))
+        def work(row: Int) {imm}:
+            if format_date_row(
+                row,
+                fields,
+                ops,
+                op_count,
+                names,
+                offsets,
+                literals,
+                dst,
+                stride,
+                lengths,
+            ) != 0:
+                cell[0] = -1
+        parallelize(work, count, par_workers)
+        return Int(cell[0])
     for row in range(count):
-        var base = row * 8
-        var year = fields[base]
-        var month = fields[base + 1]
-        var day = fields[base + 2]
-        var weekday = fields[base + 3]
-        var hour = fields[base + 4]
-        var minute = fields[base + 5]
-        var second = fields[base + 6]
-        var micros = fields[base + 7]
-        if (
-            month < 1
-            or month > 12
-            or day < 1
-            or day > 31
-            or weekday < 0
-            or weekday > 6
-            or hour < 0
-            or hour > 23
-            or minute < 0
-            or minute > 59
-            or second < 0
-            or second > 59
-            or micros < 0
-            or micros > 999999
-        ):
-            return -2
-        var pos = row * stride
-        var limit = pos + stride
-
-        for oi in range(op_count):
-            var op = Int(ops[oi * 3])
-            var width = Int(ops[oi * 3 + 1])
-            var arg = Int(ops[oi * 3 + 2])
-            if op == 0:
-                if pos + width > limit:
-                    return -1
-                pos = copy_bytes(literals, arg, width, dst, pos)
-            elif op == 1:
-                var y = year % 100 if width == 2 else year
-                var pad = 2 if width == 2 else width
-                pos = append_uint(y, pad, dst, pos, limit)
-            elif op == 2:
-                pos = append_uint(month, width, dst, pos, limit)
-            elif op == 3:
-                pos = append_name(arg + Int(month) - 1, names, offsets, dst, pos, limit)
-            elif op == 4:
-                pos = append_uint(day, width, dst, pos, limit)
-            elif op == 5:
-                pos = append_name(arg + Int(weekday), names, offsets, dst, pos, limit)
-            elif op == 6:
-                pos = append_uint(hour, width, dst, pos, limit)
-            elif op == 7:
-                var h = hour % 12
-                if h == 0:
-                    h = 12
-                pos = append_uint(h, width, dst, pos, limit)
-            elif op == 8:
-                pos = append_uint(hour % 12, width, dst, pos, limit)
-            elif op == 9:
-                var h = hour
-                if h == 0:
-                    h = 24
-                pos = append_uint(h, width, dst, pos, limit)
-            elif op == 10:
-                pos = append_uint(minute, width, dst, pos, limit)
-            elif op == 11:
-                pos = append_uint(second, width, dst, pos, limit)
-            elif op == 12:
-                pos = append_fraction(micros, width, dst, pos, limit)
-            elif op == 13:
-                pos = append_name(arg + (1 if hour >= 12 else 0), names, offsets, dst, pos, limit)
-            elif op == 14:
-                pos = append_name(arg + (1 if year >= 0 else 0), names, offsets, dst, pos, limit)
-            if pos < 0:
-                return -1
-        lengths[row] = Int64(pos - row * stride)
+        if format_date_row(
+            row,
+            fields,
+            ops,
+            op_count,
+            names,
+            offsets,
+            literals,
+            dst,
+            stride,
+            lengths,
+        ) != 0:
+            return -1
     return 0
 
 
@@ -385,8 +490,25 @@ def civil_from_days(days: Int64) -> Tuple[Int64, Int64, Int64]:
     return (year, month, day)
 
 
+def decompose_day(i: Int, days: IPtr, fields: IPtr):
+    var y, m, d = civil_from_days(days[i])
+    var weekday = (days[i] + 3) % 7
+    if weekday < 0:
+        weekday += 7
+    fields[i * 8] = y
+    fields[i * 8 + 1] = m
+    fields[i * 8 + 2] = d
+    fields[i * 8 + 3] = weekday
+    fields[i * 8 + 4] = 0
+    fields[i * 8 + 5] = 0
+    fields[i * 8 + 6] = 0
+    fields[i * 8 + 7] = 0
+
+
 @export("mb_decompose_days")
-def mb_decompose_days(days_addr: Int, count: Int, fields_addr: Int) abi("C") -> Int:
+def mb_decompose_days(
+    days_addr: Int, count: Int, fields_addr: Int, workers: Int
+) abi("C") -> Int:
     if count < 0:
         return -2
     if count == 0:
@@ -395,17 +517,12 @@ def mb_decompose_days(days_addr: Int, count: Int, fields_addr: Int) abi("C") -> 
         return -2
     var days = IPtr(unsafe_from_address=days_addr)
     var fields = IPtr(unsafe_from_address=fields_addr)
+    var par_workers = worker_count(count, workers, PARALLEL_MIN_ROWS_DAYS)
+    if par_workers > 0:
+        def work(i: Int) {imm}:
+            decompose_day(i, days, fields)
+        parallelize(work, count, par_workers)
+        return 0
     for i in range(count):
-        var y, m, d = civil_from_days(days[i])
-        var weekday = (days[i] + 3) % 7
-        if weekday < 0:
-            weekday += 7
-        fields[i * 8] = y
-        fields[i * 8 + 1] = m
-        fields[i * 8 + 2] = d
-        fields[i * 8 + 3] = weekday
-        fields[i * 8 + 4] = 0
-        fields[i * 8 + 5] = 0
-        fields[i * 8 + 6] = 0
-        fields[i * 8 + 7] = 0
+        decompose_day(i, days, fields)
     return 0

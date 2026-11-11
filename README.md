@@ -10,7 +10,8 @@ The project does not copy a frozen locale database. Babel remains a dependency
 and supplies current CLDR patterns, symbols, names, plural rules, and timezone
 data. Mojo performs grouped fixed-point rendering, date field rendering, CLDR
 pattern interpretation, and Gregorian decomposition for NumPy `datetime64`
-arrays.
+arrays. Batches at or above 131,072 rows run those per-row loops on up to 4
+workers; smaller batches stay serial (see "Parallel phase" below).
 
 ## Coverage
 
@@ -50,7 +51,11 @@ pixi run build
 pixi run test
 ```
 
-The shared library is written to `dist/libmojo-babel.so`.
+The shared library is written to `dist/libmojo-babel.so`. `max` is a required
+dependency (pinned alongside `mojo` in `pixi.toml`): the kernels' row loops take
+`parallelize` from `max.algorithm`, which ships in the `max` package rather than
+in `mojo`, so without it every `max.*` import fails with `unable to locate
+module 'max'`.
 
 ## Usage
 
@@ -137,9 +142,121 @@ which unrolling cannot address; that is work for the next phase.
 
 There is no GPU path. These kernels perform irregular integer division,
 variable-length digit emission, and short UTF-8 writes with less than two
-arithmetic operations per byte moved. CPU profiling also shows that the native
-row renderer is too short to amortize thread-launch overhead, so it remains
-serial; the benchmark covers only the CPU implementation.
+arithmetic operations per byte moved. CPU-side, the row loops are threaded
+above a measured size threshold (next section); the benchmark covers only the
+CPU implementation.
+
+### Parallel phase: row loops behind a measured threshold
+
+`mb_format_scaled`, `mb_format_dates` and `mb_decompose_days` render independent
+rows, so each one's row loop can run through `parallelize` from
+`max.algorithm` (the `std.algorithm` form does not exist on this toolchain).
+Each kernel takes its worker count as a trailing ABI argument: `0` forces the
+serial loop, `n>0` asks for `n` workers, clamped to 4. Below the threshold the
+kernel ignores the request and stays serial, so small batches never pay for
+thread launch. Python passes `mojo_babel._lib.workers()`, which defaults to 4
+and can be overridden with `MOJO_BABEL_WORKERS` for measurement and tests.
+
+**Thread-launch cost.** Measured directly on this host with an empty
+`parallelize` call: ~18.3 us at 2 workers, ~29 us at 4 — independent of the row
+count. That is why there is a threshold at all rather than "parallelise
+everything".
+
+**Crossover, then margin.** Kernel-only timings, all timed regions exactly one
+ctypes call, worker-count blocks interleaved, median of 9 blocks of 25
+(`bench/kpar.py`). Workers pinned to 4 physical cores (the parallel point),
+interpreter pinned to one core.
+
+| rows | `mb_format_scaled` serial | 2 workers | 4 workers |
+| ---: | ---: | ---: | ---: |
+| 8,192 | 1.07 ms | 1.06 ms | 1.07 ms |
+| 32,768 | 4.27 ms | 4.27 ms | 4.27 ms |
+| 49,152 | 6.31 ms | 6.33 ms | 6.34 ms |
+| 57,344 | 7.51 ms | 7.47 ms | 7.78 ms |
+| 131,071 | 17.25 ms | 17.16 ms | 17.16 ms |
+| 131,072 | 17.12 ms | 11.93 ms | 8.83 ms |
+| 262,144 | 34.45 ms | 25.38 ms | 17.04 ms |
+| 524,288 | 70.39 ms | 50.35 ms | 39.42 ms |
+
+The other two kernels cross at the same place:
+
+| rows | kernel | serial | 2 workers | 4 workers |
+| ---: | --- | ---: | ---: | ---: |
+| 131,071 | `mb_format_dates` | 15.64 ms | 15.60 ms | 16.06 ms |
+| 131,072 | `mb_format_dates` | 15.78 ms | 8.92 ms | 8.31 ms |
+| 262,144 | `mb_format_dates` | 33.13 ms | 19.93 ms | 11.53 ms |
+| 262,143 | `mb_decompose_days` | 9.51 ms | 5.64 ms | 3.06 ms |
+| 262,144 | `mb_decompose_days` | 9.39 ms | 6.37 ms | 3.37 ms |
+| 524,288 | `mb_decompose_days` | 20.22 ms | 12.80 ms | 6.73 ms |
+
+Below ~57,000 rows every kernel is flat at every worker count: the row work
+there (~2 ms) is inside the noise of one launch's own cost. Above it the gain
+appears and keeps growing. The first *reliably* winning size is 131,072 rows;
+65,536 measured anywhere from 0.99x to 1.02x across three repeats, i.e. a tie
+(same shape for dates, whose 131,071-row call was also a tie). The shipped
+threshold is therefore `PARALLEL_MIN_ROWS = 1 << 17` (131,072 rows), which is a
+2x margin over the first winning size and above every size at which the
+comparison was a tie. It is one constant shared by all three kernels.
+
+**Worker counts 1, 2, 4 and the cap.** One worker still goes through
+`parallelize` and is neutral (49,152 rows: 4.18 ms vs 4.19 ms serial at one
+worker) — `parallelize` with a single worker executes serially. Two workers gain
+1.4–1.7x and four gain 1.8–3.1x at the sizes above the threshold. Going past 4:
+
+| kernel | rows | 4 workers | 6 workers | 8 workers |
+| --- | ---: | ---: | ---: | ---: |
+| `mb_format_scaled` | 262,144 | 18.7 ms | 18.1 ms | 17.8 ms |
+| `mb_decompose_days` | 524,288 | 7.7 ms | 7.5 ms | 7.5 ms |
+
+which is flat within noise, so the cap stays at 4 as instructed.
+
+**What reaches callers.** The kernels are 1–7 % of a public batch call (that is
+the finding in `bench/analysis.md`), so kernel speedups mostly disappear into
+the Python glue. At n = 262,144, one process per configuration, median of 5:
+
+| path | serial | 4 workers | change |
+| --- | ---: | ---: | ---: |
+| `_render` (date kernel + unpack), n=262,144 | 223.5 ms | 197.4 ms | -12 % |
+| `_core` (number kernel + unpack), n=262,144 | 187.6 ms | 183.7 ms | wash (2 repeats; the 29 ms `str` unpack and the `Decimal` lane dominate) |
+| `mb_format_scaled` alone, n=262,144 | 34.6 ms | 18.3 ms | -47 % |
+| `format_decimal_batch`, n=262,144 | 997.6 ms | 990.3 ms | -0.7 % |
+| `format_currency_batch`, n=262,144 | 1077.9 ms | 999.9 ms | -7 % |
+| `format_percent_batch`, n=262,144 | 1071.0 ms | 1002.1 ms | -6 % |
+| `format_date_batch`, n=262,144 | 232.3 ms | 211.3 ms | -9 % |
+| `format_date_batch`, n=524,288 | 453.1 ms | 377.3 ms | -17 % |
+| `format_datetime_batch`, n=524,288 | 2229.4 ms | 2112.2 ms | -5 % |
+
+Also note the size table above: `format_currency_batch` at 262,144 rows measured
+-7 % here while the 50,000-row sweep measured +0.1 %, and its 50,000-row paired
+runs ranged from -8 % to +21 %. The batch level cannot resolve these changes;
+the kernel table is what the threshold is based on.
+
+**The sizes real callers pass.** The benchmark and every documented usage
+example format 50,000 rows, which is *below* the threshold, so those calls
+remain serial and execute the pre-change loop exactly. No caller in this
+repository reaches the parallel path, and at 50,000 rows the batch timings show
+no reproducible difference in either direction. Nothing was reverted, because
+at every size the threshold admits, the parallel loop wins; the 50,000-row
+measurements are reported as ties rather than sold as gains.
+
+**Correctness.** `tests/test_parallel.py` renders the same input at 1, 1023,
+70,000 and 131,073 rows with 0, 1, 2 and 4 workers and asserts the outputs are
+identical, for decimals, currency, percent, dates (two patterns) and datetimes.
+The A/B driver also refuses to report a number if the CRC of the output differs
+between worker counts. A 200,000-row batch whose last row is invalid returns
+`-2` from both the serial and the parallel loop, so the error flag crosses the
+worker boundary.
+
+To reproduce:
+
+```bash
+taskset -c 2-5 pixi run python bench/kpar.py scaled 262144 0 1 2 4
+taskset -c 2-5 pixi run python bench/kpar.py dates  131072 0 1 2 4
+taskset -c 2-5 pixi run python bench/kpar.py days   262144 0 1 2 4
+MOJO_BABEL_WORKERS=0 pixi run python bench/sizebench.py 262144 5
+MOJO_BABEL_WORKERS=4 pixi run python bench/sizebench.py 262144 5
+```
+
 
 ## How it works
 
