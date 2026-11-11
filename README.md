@@ -83,20 +83,21 @@ print(format_date_batch(days, locale="en_US"))
 
 ## Benchmarks
 
-Measured by `pixi run bench` on this machine on 2026-08-23: Intel Xeon E5-2697
-v4 at 2.30 GHz, x86-64, 72 logical CPUs. Each row formats 50,000 values; the
-best of three runs is reported. The reference is the installed Babel 2.18.0
-through its public scalar API.
+Measured by `pixi run bench` on this machine on 2026-11-11: Intel Xeon E5-2697
+v4 at 2.30 GHz, x86-64, 72 logical CPUs, load average ~16. Each row formats
+50,000 identical inputs on both sides; the figure is the median of four
+`pixi run bench` runs (each run already reports its own best of three). The
+reference is the installed Babel through its public scalar API.
 
 | case | mojo-babel | Babel | speedup |
 | --- | ---: | ---: | ---: |
-| decimal, 50k, en_US | 154.3 ms | 919.9 ms | 5.96x |
-| decimal, 50k, hi_IN | 155.6 ms | 980.2 ms | 6.30x |
-| currency, 50k, fr_FR | 165.1 ms | 2197.1 ms | 13.30x |
-| percent, 50k, de_DE | 76.7 ms | 830.5 ms | 10.83x |
-| date, 50k datetime64, en_US | 33.0 ms | 511.6 ms | 15.52x |
-| date, 50k datetime64, ja_JP | 45.6 ms | 563.7 ms | 12.37x |
-| datetime, 50k, de_DE | 169.4 ms | 972.5 ms | 5.74x |
+| decimal, 50k, en_US | 157.4 ms | 1007.6 ms | 6.40x |
+| decimal, 50k, hi_IN | 160.8 ms | 998.8 ms | 6.21x |
+| currency, 50k, fr_FR | 168.8 ms | 2207.6 ms | 13.07x |
+| percent, 50k, de_DE | 77.5 ms | 864.3 ms | 11.15x |
+| date, 50k datetime64, en_US | 38.4 ms | 544.1 ms | 14.17x |
+| date, 50k datetime64, ja_JP | 46.3 ms | 592.4 ms | 12.78x |
+| datetime, 50k, de_DE | 183.3 ms | 953.5 ms | 5.20x |
 
 Run `pixi run bench` on the target machine instead of treating these results as
 portable; locale mix, string lengths, and CPU frequency all matter.
