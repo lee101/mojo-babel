@@ -120,6 +120,10 @@ def _compile(pattern: str, locale_id: str) -> _Program:
                 # compatibility instead of approximating that at the ABI.
                 raise _UnsupportedPattern("fractional seconds require Babel rounding")
             operations.append((12, width, 0))
+        elif char in ("z", "Z", "O", "v", "V", "x", "X"):
+            # The reference datetime carries a tzinfo, and babel.dates resolves these
+            # fields from it; the native kernel only receives decomposed fields.
+            raise _UnsupportedPattern(f"timezone field {char!r} requires Babel")
         elif char == "a":
             if width > 5:
                 raise _UnsupportedPattern(f"unsupported period width {width}")
@@ -192,13 +196,24 @@ def _render(fields: np.ndarray, pattern: str, locale: Locale) -> list[str]:
     ]
 
 
-def _date_fields(values: Iterable[_datetime.date]) -> np.ndarray:
+def _date_fields(values: Iterable[_datetime.date], pattern: str | None = None) -> np.ndarray:
+    # upstream babel.dates.DateTimeFormat reads .hour/.minute/.second straight off the
+    # value, so a pure date raises AttributeError when the pattern needs a time field.
+    needs_time = False
+    if pattern is not None:
+        needs_time = any(
+            token_type == "field"
+            and token[0] in ("H", "h", "K", "k", "m", "s", "S", "A", "a", "b", "B")
+            for token_type, token in _babel.tokenize_pattern(pattern)
+        )
     rows = []
     for value in values:
         if isinstance(value, _datetime.datetime):
             value = value.date()
         if not isinstance(value, _datetime.date):
             raise TypeError(f"expected date or datetime, got {type(value).__name__}")
+        if needs_time:
+            raise AttributeError(f"'date' object has no attribute 'hour'")
         rows.append(
             (value.year, value.month, value.day, value.weekday(), 0, 0, 0, 0)
         )
@@ -262,7 +277,13 @@ def format_date(
     locale = _locale(locale)
     pattern = _date_pattern(format, locale)
     try:
-        return _render(_date_fields([date]), pattern, locale)[0]
+        fields = _date_fields([date], pattern)
+    except TypeError:
+        # upstream babel.dates.format_date: parse_pattern(format).apply(date, locale)
+        # asserts the argument is a date, raising AssertionError for other types.
+        return _babel.format_date(date, format, locale)
+    try:
+        return _render(fields, pattern, locale)[0]
     except _UnsupportedPattern:
         return _babel.format_date(date, format, locale)
 
@@ -287,7 +308,7 @@ def format_date_batch(
             raise ValueError("invalid buffer passed to Mojo date decomposition")
     else:
         values = list(dates)
-        fields = _date_fields(values)
+        fields = _date_fields(values, pattern)
     try:
         return _render(fields, pattern, locale)
     except _UnsupportedPattern:
@@ -307,13 +328,17 @@ def format_time(
 ) -> str:
     if tzinfo is not None:
         return _babel.format_time(time, format, tzinfo, locale)
+    # upstream babel.dates.format_time: `ref_date` selects the timezone variant.
+    reference_date = time.date() if isinstance(time, _datetime.datetime) else None
     value = _babel._get_time(time, None)
     locale = _locale(locale)
     pattern = _time_pattern(format, locale)
     try:
         return _render(_time_fields([value]), pattern, locale)[0]
     except _UnsupportedPattern:
-        return _babel.format_time(value, format, None, locale)
+        return _babel.parse_pattern(pattern).apply(
+            value, locale, reference_date=reference_date
+        )
 
 
 def format_time_batch(
@@ -339,9 +364,12 @@ def format_datetime(
     tzinfo: _datetime.tzinfo | None = None,
     locale: Locale | str | None = None,
 ) -> str:
-    value = _babel._ensure_datetime_tzinfo(_babel._get_datetime(datetime), tzinfo)
+    instant = _babel._get_datetime(datetime)
+    value = _babel._ensure_datetime_tzinfo(instant, tzinfo)
     locale = _locale(locale)
     if format in ("full", "long", "medium", "short"):
+        # upstream babel.dates.format_datetime: format_time receives the tz-aware
+        # instant, whose reference date selects the timezone variant.
         template = (
             _babel.get_datetime_format(format, locale)
             .replace("'", "")
@@ -354,7 +382,8 @@ def format_datetime(
     try:
         return _render(_datetime_fields([value]), pattern, locale)[0]
     except _UnsupportedPattern:
-        return _babel.format_datetime(value, format, None, locale)
+        # upstream babel.dates.format_datetime: parse_pattern(format).apply(datetime, locale)
+        return _babel.parse_pattern(format).apply(value, locale)
 
 
 def format_datetime_batch(
@@ -381,7 +410,12 @@ def format_datetime_batch(
     try:
         return _render(_datetime_fields(values), pattern, locale)
     except _UnsupportedPattern:
-        return [_babel.format_datetime(value, format, None, locale) for value in values]
+        # upstream babel.dates.format_datetime: parse_pattern(format).apply(datetime, locale)
+        parsed = _babel.parse_pattern(format)
+        return [
+            parsed.apply(_babel._ensure_datetime_tzinfo(_babel._get_datetime(value)), locale)
+            for value in values
+        ]
 
 
 format_timedelta = _babel.format_timedelta
