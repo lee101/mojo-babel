@@ -170,7 +170,7 @@ def mb_format_scaled(
         var factor_vec = SIMD[DType.int64, W](factor)
         var i = 0
         while i + W <= count:
-            var scaled = values.load[width=W](i)
+            var scaled = values.unsafe_load[width=W](i)
             values.store(i, scaled // factor_vec)
             lengths.store(i, scaled % factor_vec)
             i += W
