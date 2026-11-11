@@ -140,13 +140,53 @@ branches on the positive magnitudes the numbers path passes in. The remaining co
 is the real 64-bit integer division per digit — `idiv` latency, not loop overhead —
 which unrolling cannot address; that is work for the next phase.
 
-There is no GPU path. These kernels perform irregular integer division,
-variable-length digit emission, and short UTF-8 writes with less than two
-arithmetic operations per byte moved. CPU-side, the row loops are threaded
-above a measured size threshold (next section); the benchmark covers only the
-CPU implementation.
+There is no GPU path. CPU only: memory-bound. The GPU candidate gate is ≥2
+flops per byte moved; every kernel and every hot glue row in
+`bench/analysis.md` is below it, so this phase shipped no GPU code, no device
+allocations, and no new tests (there is nothing GPU-specific to skip on a
+CPU-only host). CPU-side, the row loops are threaded above a measured size
+threshold (next section); the benchmark covers only the CPU implementation.
 
-### Parallel phase: row loops behind a measured threshold
+### GPU phase: gate failed on arithmetic intensity, nothing shipped
+
+The phase rule is that only kernels above roughly **2 flops per byte moved** are
+GPU candidates. The gate was evaluated against `bench/analysis.md` (phase 1
+counts, re-derived from the kernel sources rather than copied) before any GPU
+work started.
+
+| kernel / row | bytes moved per unit | generous flops per unit | flops/byte | verdict |
+| --- | ---: | ---: | ---: | --- |
+| `mb_format_scaled` (#5) | 21 B (8 in, 5 out, 8 length) | 27 (9 digits × 3 ops) | **1.29** | below gate |
+| `mb_decompose_days` (#8) | 72 B (1 in, 8 × int64 out) | 40 (8 fields × 5 ops) | **0.56** | below gate |
+| `mb_format_dates` (#4) | 16.4 MB / 50k rows | ~1.8 M | **0.11** | below gate |
+| `_render_many` Decimal lane (#1) | 5.2 MB Decimal heap | ~0.72 M | **0.14** | below gate |
+| `_prepare_scaled_floats` (#7) | 1.2 MB in/out/bool | ~0.4 M | **0.33** | below gate |
+| unpack / field extraction / join (#2, #3, #9) | — | 0 | **0.00** | pure `str`/allocation glue |
+
+`mb_format_scaled` is the highest at ~1.3 flops/byte and is still 35 % under the
+gate; the counting above is deliberately generous (3 ops per emitted digit,
+every field counted as 5 flops). Past the arithmetic, none of these kernels is
+GPU-shaped regardless of the ratio: they are a serial `idiv` chain per digit,
+a data-dependent three-integer op stream per row, and variable-length UTF-8
+writes into caller-owned byte rows — all control flow and small integer
+division, the two things a device handles worst. The dominant cost in every
+number and datetime batch is Python glue (133 + 24–60 ms per call), which no
+kernel, CPU or GPU, can move.
+
+The GPU availability check nevertheless ran, because the verdict should record
+both gate results, not just the one that stopped the work:
+
+```bash
+$ nvidia-smi --query-gpu=memory.free --format=csv,noheader
+5554 MiB
+```
+
+5554 MiB free is above the 4000 MiB floor, so this phase *would* have been
+permitted to run — it was skipped on arithmetic intensity, not on the shared
+device. No before/after numbers exist to record because no GPU path was built,
+and none are invented here.
+
+
 
 `mb_format_scaled`, `mb_format_dates` and `mb_decompose_days` render independent
 rows, so each one's row loop can run through `parallelize` from
