@@ -226,3 +226,66 @@ Notes and caveats:
   times with agreement within 10 %.
 - The `pixi run bench` runs are the authoritative end-to-end numbers; the probes
   are diagnostic and never ran concurrently with them (same flock).
+
+---
+
+## 8. Unroll phase: every candidate measured, none kept
+
+Phase 2 targeted technique 1 (multi-accumulator reductions), 2 (compile-time
+unrolling of fixed trip counts), 3 (hoisting loop invariants) and 4 (removing
+bounds checks the loop bound proves). Source is unchanged; the library is
+byte-identical to the phase-1 build. Nothing below shipped.
+
+**Technique 1 does not apply.** There is no reduction in this code base: every kernel
+walks rows independently and writes digits. There is no running sum, so there is no
+floating-point add chain to break and no summation order to document.
+
+**Technique 2 is not expressible on this pin.** `@parameter for` is rejected
+(`'for' statement does not support decorators`), `unroll(range(n))` is an unknown
+declaration, comptime recursion in a nested `def` is rejected, and a `@__parameter`
+closure cannot be indexed with a runtime value. So a fixed trip count cannot be
+unrolled at comptime in the pinned dialect; the only route is a hand-written or
+generated straight-line block per width, which measured as a loss (see below).
+
+**Measurement method.** `pixi run bench` cannot resolve these kernels: they are
+1–7 % of a batch total, and two runs of the *same* `.so` on this box differed by up to
+15 % per row (turbo decay from 3.6 GHz to 2.3 GHz mid-run, plus 2 sockets × 18 cores).
+Kernels were therefore timed in isolation — same vectors as the harness (`rng(7)`,
+50,000 rows), ctypes with `argtypes` set, `taskset -c 2`, 1.5 s of warm-up past turbo
+decay, 8 interleaved A/B blocks of 25, median. Baseline reproduces to ±0.3 %:
+`mb_format_scaled` 1.666 ms, `mb_decompose_days` 1.399 ms, `mb_format_dates`
+unchanged at 0.11 flops/byte (not attempted). In-process A/B is *not* valid on this
+box: the first-loaded library is systematically faster regardless of code, so each
+number above comes from one library per process.
+
+| candidate | kernel | baseline | candidate | delta |
+| --- | --- | ---: | ---: | --- |
+| `pow10` loop → 16-entry comptime `SIMD` table | `mb_format_scaled` | 1.666 ms | 1.831 ms | +10 % |
+| digit divisor chain `//= 10` → table lookup by position | `mb_format_scaled` | 1.666 ms | 1.850 ms | +11 % |
+| per-digit `if pos >= limit` check removed | `mb_format_scaled` | 1.666 ms | 1.760 ms | +6 % |
+| `append_uint` divisor chain → table lookup | `mb_format_scaled` | 1.666 ms | 1.829 ms | +10 % |
+| fraction digits written per-width (`write_fraction[1..4]`) | `mb_format_scaled` | 1.666 ms | 1.710 ms | +3 % |
+| `i * 8` index arithmetic → running pointer / 8-wide store | `mb_decompose_days` | 1.399 ms | 1.438 ms | +3 % |
+
+**Why every candidate loses.** The disassembly of `format_scaled_row` shows that the
+compiler already does the work these techniques target: the `divisor //= 10` chain is
+strength-reduced to `mulx 0xcccccccccccccccd` + `shr $3` hoisted to the top of the
+iteration, the `pow10(n)` loop is unrolled into a move, and the sign-correction
+branches around `/` and `%` are eliminated on the positive magnitudes the numbers
+path passes. Replacing those with a table load adds a load and a register copy to a
+loop that already runs at 187 instructions/row. Removing the bound check does not
+help because the check `and`-merges into an existing compare and the store address is
+already computed.
+
+**Where the time actually is.** Per row: `digits10` is a serial `n //= 10` chain
+(≤7 iterations, one per integer digit) and each digit costs one *real* 64-bit `idiv`
+(latency 32–40 cycles on Broadwell-EP) that cannot be strength-reduced because the
+divisor is data-dependent. That division latency — not loop overhead, not the
+reduction order, not the bound checks — is the kernel's floor, and it is why
+unrolling cannot pay here. Splitting it into per-digit constant divisors is only
+possible with SIMD/reciprocal-multiply tricks, which is the next phase, not this one.
+
+**Consequence for the next phase.** Do not re-try 2/3/4 on these kernels; the compiler
+already performs them. The payoff is in (a) the `digits10`/`idiv` chain per digit, and
+(b) the glue rows of §6 (#1, #2, #3, #9 — 133 + 24–60 ms), which are still untouched
+and still dominate every number and datetime batch total.

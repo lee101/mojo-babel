@@ -96,6 +96,45 @@ through its public scalar API.
 Run `pixi run bench` on the target machine instead of treating these results as
 portable; locale mix, string lengths, and CPU frequency all matter.
 
+### Unroll phase: no change shipped, and why
+
+The unroll phase looked for serial dependency chains and loop overhead in the
+kernels. Every candidate was compiled and timed against the current code; none was
+faster at real caller sizes (50,000 rows), so all of them were reverted. The kernels
+are unchanged and produce bit-identical output, including the existing
+floating-point summation order — no multi-accumulator reduction exists in this code,
+because no kernel in it performs a reduction.
+
+Two `pixi run bench` runs of this byte-identical library, same machine, same day:
+
+| run | decimal en_US | decimal hi_IN | currency fr_FR | percent de_DE | date en_US | date ja_JP | datetime de_DE |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| before | 166.1 ms | 176.5 ms | 173.3 ms | 81.5 ms | 39.6 ms | 44.4 ms | 182.4 ms |
+| after | 188.5 ms | 178.3 ms | 203.3 ms | 85.4 ms | 35.9 ms | 44.1 ms | 193.9 ms |
+
+The spread between the two runs (up to 15 % in both directions) is machine noise,
+not a regression or an improvement: the library is the same file. This is why the
+whole-batch table cannot resolve a kernel change that saves ~0.1 ms out of 166 ms —
+the native kernels are 1–7 % of each batch total (see `bench/analysis.md`). Kernel
+candidates were therefore also timed directly with cache-hot ctypes calls, pinned to
+one core, warmed past turbo decay, interleaved A/B, median of 8 blocks of 25:
+
+| candidate | kernel | before | after | verdict |
+| --- | --- | ---: | ---: | --- |
+| `pow10` loop → compile-time table | `mb_format_scaled` | 1.666 ms | 1.831 ms | reverted, 10 % slower |
+| digit divisor chain `//= 10` → table lookup | `mb_format_scaled` | 1.666 ms | 1.850 ms | reverted, 11 % slower |
+| per-digit output bound check removed | `mb_format_scaled` | 1.666 ms | 1.760 ms | reverted, 6 % slower |
+| `append_uint` divisor chain → table lookup | `mb_format_scaled` | 1.666 ms | 1.829 ms | reverted, 10 % slower |
+| fraction digits specialised per width | `mb_format_scaled` | 1.666 ms | 1.710 ms | reverted, neutral to slower |
+| loop-invariant `i * 8` hoisted to a pointer bump | `mb_decompose_days` | 1.399 ms | 1.438 ms | reverted, 3 % slower |
+
+The compiler already strength-reduces the `divisor //= 10` chain to a
+multiply-and-shift at the top of each iteration (visible in the disassembly), already
+unrolls the divisors' small `pow10` loop, and already removes the sign-correction
+branches on the positive magnitudes the numbers path passes in. The remaining cost
+is the real 64-bit integer division per digit — `idiv` latency, not loop overhead —
+which unrolling cannot address; that is work for the next phase.
+
 There is no GPU path. These kernels perform irregular integer division,
 variable-length digit emission, and short UTF-8 writes with less than two
 arithmetic operations per byte moved. CPU profiling also shows that the native
